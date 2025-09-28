@@ -4,10 +4,19 @@ Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-Version: 0.4.10 (November 25, 2020) - see history.txt for versions history
+Version: 0.66.0 (September 28, 2025) - Major efficiency improvements for gas boiler systems
+Enhanced Features:
+- Smart overshoot prevention with configurable tolerance
+- Minimum efficient runtime logic for gas boiler systems
+- Boiler startup time compensation
+- Temperature trend analysis for predictive heating
+- Configurable heating system profiles (gas boiler, electric, heat pump, underfloor)
+- Enhanced logging and efficiency metrics
+- Improved minimum heating logic with Mode4 fixes
+- Comprehensive efficiency optimizations for gas radiator systems
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.11" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.66.0" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -27,11 +36,21 @@ Version: 0.4.10 (November 25, 2020) - see history.txt for versions history
         <param field="Mode3" label="Heating Switches (csv list of idx)" width="100px" required="true" default="0"/>
         <param field="Mode4" label="Apply minimum heating per cycle" width="200px">
             <options>
-				<option label="ony when heating required" value="Normal"  default="true" />
+                <option label="only when heating required" value="Normal" default="true" />
                 <option label="always" value="Forced"/>
             </options>
-        </param> 
+        </param>
         <param field="Mode5" label="Calc. cycle, Min. Heating time /cycle, Pause On delay, Pause Off delay, Forced mode duration (all in minutes), Delta max (°C)" width="200px" required="true" default="30,0,2,1,60,0.2"/>
+        <param field="Mode7" label="Heating System Profile" width="200px">
+            <options>
+                <option label="Gas Boiler + Radiators" value="gas_radiator" default="true"/>
+                <option label="Electric Heating" value="electric"/>
+                <option label="Heat Pump" value="heat_pump"/>
+                <option label="Underfloor Heating" value="underfloor"/>
+                <option label="Custom" value="custom"/>
+            </options>
+        </param>
+        <param field="Mode8" label="Boiler Startup Time, Min Efficient Runtime, Radiator Lag Time (minutes)" width="200px" required="false" default="3,10,12"/>
         <param field="Mode6" label="Logging Level" width="200px">
             <options>
                 <option label="Normal" value="Normal"  default="true"/>
@@ -79,6 +98,45 @@ class BasePlugin:
         self.InTempSensors = []
         self.OutTempSensors = []
         self.Heaters = []
+        # Heating System Profiles
+        self.HeatingProfiles = {
+            'gas_radiator': {
+                'startup_time': 3,
+                'min_runtime': 10,
+                'lag_time': 12,
+                'overshoot_tolerance': 0.1,
+                'efficiency_priority': True
+            },
+            'electric': {
+                'startup_time': 0,
+                'min_runtime': 2,
+                'lag_time': 5,
+                'overshoot_tolerance': 0.05,
+                'efficiency_priority': False
+            },
+            'heat_pump': {
+                'startup_time': 2,
+                'min_runtime': 15,
+                'lag_time': 8,
+                'overshoot_tolerance': 0.1,
+                'efficiency_priority': True
+            },
+            'underfloor': {
+                'startup_time': 5,
+                'min_runtime': 20,
+                'lag_time': 30,
+                'overshoot_tolerance': 0.2,
+                'efficiency_priority': True
+            },
+            'custom': {
+                'startup_time': 3,
+                'min_runtime': 10,
+                'lag_time': 12,
+                'overshoot_tolerance': 0.1,
+                'efficiency_priority': True
+            }
+        }
+        
         self.InternalsDefaults = {
             'ConstC': float(60),  # inside heating coeff, depends on room size & power of your heater (60 by default)
             'ConstT': float(1),  # external heating coeff,depends on the insulation relative to the outside (1 by default)
@@ -88,7 +146,21 @@ class BasePlugin:
             'LastInT': float(0),  # inside temperature at last calculation
             'LastOutT': float(0),  # outside temprature at last calculation
             'LastSetPoint': float(20),  # setpoint at time of last calculation
-            'ALStatus': 0}  # AutoLearning status (0 = uninitialized, 1 = initialized, 2 = disabled)
+            'ALStatus': 0,  # AutoLearning status (0 = uninitialized, 1 = initialized, 2 = disabled)
+            # Enhanced variables for smart heating
+            'HeatingSystemType': 'gas_radiator',
+            'BoilerStartupTime': 3,
+            'MinEfficiencyRuntime': 10,
+            'RadiatorLagTime': 12,
+            'OvershootTolerance': 0.1,
+            'TempHistory': [],
+            'LastThreeTemps': [20.0, 20.0, 20.0],
+            'EfficiencyMode': True,
+            'TotalHeatingTime': 0,
+            'EffectiveHeatingTime': 0,
+            'HeatingCycles': 0,
+            'OvershootEvents': 0,
+            'InefficientCycles': 0}
         self.Internals = self.InternalsDefaults.copy()
         self.heat = False
         self.pause = False
@@ -202,6 +274,46 @@ class BasePlugin:
                 Domoticz.Error("Delta max missing in parameters. Add the field in the plugin configuration (default value=0.2)")
         else:
             Domoticz.Error("Error reading Mode5 parameters")
+
+        # Parse heating system profile (Mode7)
+        heating_profile = Parameters.get("Mode7", "gas_radiator")
+        if heating_profile in self.HeatingProfiles:
+            profile = self.HeatingProfiles[heating_profile]
+            self.Internals['HeatingSystemType'] = heating_profile
+            self.Internals['OvershootTolerance'] = profile['overshoot_tolerance']
+            self.WriteLog("Using heating system profile: {}".format(heating_profile), "Verbose")
+        else:
+            self.WriteLog("Unknown heating system profile: {}, using gas_radiator".format(heating_profile), "Normal")
+            heating_profile = "gas_radiator"
+            profile = self.HeatingProfiles[heating_profile]
+
+        # Parse custom heating system parameters (Mode8)
+        if Parameters.get("Mode8", ""):
+            heating_params = parseCSV(Parameters["Mode8"])
+            if len(heating_params) >= 3:
+                self.Internals['BoilerStartupTime'] = CheckParam("Boiler Startup Time", heating_params[0], profile['startup_time'])
+                self.Internals['MinEfficiencyRuntime'] = CheckParam("Min Efficiency Runtime", heating_params[1], profile['min_runtime'])
+                self.Internals['RadiatorLagTime'] = CheckParam("Radiator Lag Time", heating_params[2], profile['lag_time'])
+                self.WriteLog("Custom heating parameters: Startup={}min, MinRuntime={}min, Lag={}min".format(
+                    self.Internals['BoilerStartupTime'], self.Internals['MinEfficiencyRuntime'], self.Internals['RadiatorLagTime']), "Verbose")
+            else:
+                # Use profile defaults
+                self.Internals['BoilerStartupTime'] = profile['startup_time']
+                self.Internals['MinEfficiencyRuntime'] = profile['min_runtime']
+                self.Internals['RadiatorLagTime'] = profile['lag_time']
+                self.WriteLog("Using profile defaults for heating system parameters", "Verbose")
+        else:
+            # Use profile defaults
+            self.Internals['BoilerStartupTime'] = profile['startup_time']
+            self.Internals['MinEfficiencyRuntime'] = profile['min_runtime']
+            self.Internals['RadiatorLagTime'] = profile['lag_time']
+            self.WriteLog("Using profile defaults for heating system parameters", "Verbose")
+
+        # Validate heating parameters
+        if self.Internals['MinEfficiencyRuntime'] < 5:
+            self.WriteLog("Warning: MinEfficiencyRuntime below 5 minutes may be inefficient for most systems", "Normal")
+        if self.Internals['BoilerStartupTime'] >= self.Internals['MinEfficiencyRuntime']:
+            self.WriteLog("Warning: BoilerStartupTime should be less than MinEfficiencyRuntime", "Normal")
 
         # loads persistent variables from dedicated user variable
         # note: to reset the thermostat to default values (i.e. ignore all past learning),
@@ -331,55 +443,217 @@ class BasePlugin:
 
 
     def AutoMode(self):
-
+        """Enhanced smart heating algorithm with efficiency optimizations"""
         self.WriteLog("Temperatures: Inside = {} / Outside = {}".format(self.intemp, self.outtemp), "Verbose")
-
-        if self.intemp > self.setpoint + self.deltamax:
-            self.WriteLog("Temperature exceeds setpoint", "Verbose")
-            overshoot = True
+        
+        # Update temperature history for trend analysis
+        self.updateTempHistory()
+        
+        # Analyze temperature trends
+        temp_trend = self.analyzeTempTrend()
+        
+        # Get current heating system configuration
+        overshoot_tolerance = self.Internals.get('OvershootTolerance', 0.1)
+        
+        # Step 1: Check for overshoot with smart tolerance
+        if self.intemp > self.setpoint + overshoot_tolerance:
+            self.WriteLog("Temperature exceeds setpoint + tolerance ({:.1f}°C), no heating".format(overshoot_tolerance), "Status")
             power = 0
+            overshoot = True
+            reason = "Overshoot Prevention"
+        
+        # Step 2: Check if temperature is very close to setpoint and stable/rising
+        elif abs(self.intemp - self.setpoint) <= 0.1 and (temp_trend['stable'] or temp_trend['rising']):
+            self.WriteLog("Temperature near setpoint and stable/rising, no heating needed", "Verbose")
+            power = 0
+            overshoot = False
+            reason = "Temperature Stable at Setpoint"
+        
         else:
             overshoot = False
+            # Step 3: Calculate heating power with learning
             if self.learn:
                 self.AutoCallib()
             else:
                 self.learn = True
+                
+            # Standard power calculation
             if self.outtemp is None:
                 power = round((self.setpoint - self.intemp) * self.Internals["ConstC"], 1)
             else:
                 power = round((self.setpoint - self.intemp) * self.Internals["ConstC"] +
                               (self.setpoint - self.outtemp) * self.Internals["ConstT"], 1)
+            
+            # Step 4: Apply predictive heating adjustments
+            if temp_trend['falling'] and temp_trend['rate'] < -0.1:  # Significant temperature drop
+                predictive_boost = min(10, abs(temp_trend['rate']) * 20)  # Up to 10% boost
+                power += predictive_boost
+                reason = "Predictive Heating (falling trend)"
+                self.WriteLog("Applied predictive heating boost: +{:.1f}% due to falling trend".format(predictive_boost), "Verbose")
+            else:
+                reason = "Standard Calculation"
 
+        # Step 5: Apply power limits
         if power < 0:
             power = 0  # lower limit
         elif power > 100:
             power = 100  # upper limit
 
-        # apply minimum power as required
-        if power <= self.minheatpower and (Parameters["Mode4"] == "Forced" or not overshoot):
-            self.WriteLog(
-                "Calculated power is {}, applying minimum power of {}".format(power, self.minheatpower), "Verbose")
-            power = self.minheatpower
+        # Step 6: Apply smart minimum power logic
+        power = self.applySmartMinimumPower(power, overshoot, reason)
+        
+        # Step 7: Apply efficiency runtime optimization
+        power, final_duration = self.applyEfficiencyRuntime(power)
+        
+        # Step 8: Execute heating decision with enhanced logging
+        self.executeSmartHeating(power, final_duration, reason, temp_trend)
+        
+        self.lastcalc = datetime.now()
 
-        heatduration = round(power * self.calculate_period / 100)
-        self.WriteLog("Calculation: Power = {} -> heat duration = {} minutes".format(power, heatduration), "Verbose")
+    def updateTempHistory(self):
+        """Update temperature history for trend analysis"""
+        # Maintain last 3 temperatures for trend analysis
+        self.Internals['LastThreeTemps'].append(self.intemp)
+        if len(self.Internals['LastThreeTemps']) > 3:
+            self.Internals['LastThreeTemps'].pop(0)
+        
+        # Maintain longer history (last 10 readings)
+        if len(self.Internals['TempHistory']) >= 10:
+            self.Internals['TempHistory'].pop(0)
+        self.Internals['TempHistory'].append(self.intemp)
 
+    def analyzeTempTrend(self):
+        """Analyze temperature trends for predictive heating"""
+        if len(self.Internals['LastThreeTemps']) >= 3:
+            temps = self.Internals['LastThreeTemps']
+            # Calculate trend over 2 cycles
+            trend_rate = (temps[-1] - temps[0]) / 2  # °C per cycle
+            
+            trend_info = {
+                'falling': trend_rate < -0.05,
+                'rising': trend_rate > 0.05,
+                'stable': abs(trend_rate) <= 0.05,
+                'rate': trend_rate,
+                'significant': abs(trend_rate) > 0.1
+            }
+            
+            self.WriteLog("Temperature trend: rate={:.3f}°C/cycle, {}".format(
+                trend_rate, 'falling' if trend_info['falling'] else 'rising' if trend_info['rising'] else 'stable'), "Verbose")
+            
+            return trend_info
+        
+        return {'falling': False, 'rising': False, 'stable': True, 'rate': 0, 'significant': False}
+
+    def applySmartMinimumPower(self, calculated_power, overshoot, reason):
+        """Apply intelligent minimum power logic"""
+        if calculated_power <= 0:
+            return 0
+            
+        # Don't apply minimum power during overshoot
+        if overshoot:
+            return 0
+            
+        # Apply minimum power based on Mode4 setting and efficiency considerations
+        mode4_setting = Parameters.get("Mode4", "Normal")
+        
+        if calculated_power <= self.minheatpower:
+            if mode4_setting == "Forced":
+                self.WriteLog("Calculated power is {:.1f}%, applying minimum power of {}% (forced mode)".format(
+                    calculated_power, self.minheatpower), "Verbose")
+                return self.minheatpower
+            elif calculated_power > 0:  # Only apply minimum if heating is actually needed
+                self.WriteLog("Calculated power is {:.1f}%, applying minimum power of {}% (heating required)".format(
+                    calculated_power, self.minheatpower), "Verbose")
+                return self.minheatpower
+        
+        return calculated_power
+
+    def applyEfficiencyRuntime(self, power_percent):
+        """Apply minimum efficient runtime for boiler systems"""
+        if power_percent <= 0:
+            return 0, 0
+        
+        # Calculate initial duration from power percentage
+        initial_duration = round(power_percent * self.calculate_period / 100)
+        
+        # Get efficiency parameters
+        startup_time = self.Internals.get('BoilerStartupTime', 3)
+        min_runtime = self.Internals.get('MinEfficiencyRuntime', 10)
+        efficiency_mode = self.Internals.get('EfficiencyMode', True)
+        
+        if not efficiency_mode:
+            return power_percent, initial_duration
+        
+        # Calculate minimum total time (startup + effective heating)
+        min_total_time = startup_time + min_runtime
+        
+        if initial_duration > 0 and initial_duration < min_total_time:
+            # Adjust power to meet minimum efficient runtime
+            efficient_duration = min_total_time
+            efficient_power = min(efficient_duration * 100 / self.calculate_period, 100)
+            
+            self.WriteLog("Efficiency optimization: extending from {:.1f}min to {:.1f}min (power: {:.1f}% -> {:.1f}%)".format(
+                initial_duration, efficient_duration, power_percent, efficient_power), "Status")
+            
+            # Track efficiency metrics
+            self.Internals['HeatingCycles'] = self.Internals.get('HeatingCycles', 0) + 1
+            
+            return efficient_power, efficient_duration
+        
+        return power_percent, initial_duration
+
+    def executeSmartHeating(self, power, duration, reason, temp_trend):
+        """Execute heating decision with comprehensive logging"""
+        
+        # Enhanced logging
+        self.WriteLog("=== HEATING DECISION ===", "Status")
+        self.WriteLog("Power: {:.1f}% | Duration: {:.1f}min | Reason: {}".format(power, duration, reason), "Status")
+        self.WriteLog("Current: {:.1f}°C | Setpoint: {:.1f}°C | Trend: {:.3f}°C/cycle".format(
+            self.intemp, self.setpoint, temp_trend.get('rate', 0)), "Status")
+        
         if power == 0:
             self.switchHeat(False)
-            Domoticz.Debug("No heating requested !")
+            self.WriteLog("No heating requested", "Verbose")
         else:
-            self.endheat = datetime.now() + timedelta(minutes=heatduration)
-            Domoticz.Debug("End Heat time = " + str(self.endheat))
+            # Calculate end time and switch on
+            self.endheat = datetime.now() + timedelta(minutes=duration)
+            self.WriteLog("Heating until: {}".format(self.endheat.strftime("%H:%M:%S")), "Status")
+            
+            # Update efficiency metrics
+            self.Internals['TotalHeatingTime'] = self.Internals.get('TotalHeatingTime', 0) + duration
+            startup_time = self.Internals.get('BoilerStartupTime', 3)
+            effective_time = max(0, duration - startup_time)
+            self.Internals['EffectiveHeatingTime'] = self.Internals.get('EffectiveHeatingTime', 0) + effective_time
+            
+            # Switch heating on
             self.switchHeat(True)
+            
+            # Update learning variables
             if self.Internals["ALStatus"] < 2:
                 self.Internals['LastPwr'] = power
                 self.Internals['LastInT'] = self.intemp
                 self.Internals['LastOutT'] = self.outtemp
                 self.Internals['LastSetPoint'] = self.setpoint
                 self.Internals['ALStatus'] = 1
-                self.saveUserVar()  # update user variables with latest learning
+                self.saveUserVar()
+        
+        # Log efficiency metrics periodically
+        if self.Internals.get('HeatingCycles', 0) % 10 == 0 and self.Internals.get('HeatingCycles', 0) > 0:
+            self.logEfficiencyMetrics()
 
-        self.lastcalc = datetime.now()
+    def logEfficiencyMetrics(self):
+        """Log efficiency metrics for monitoring"""
+        total_time = self.Internals.get('TotalHeatingTime', 1)  # Avoid division by zero
+        effective_time = self.Internals.get('EffectiveHeatingTime', 0)
+        cycles = self.Internals.get('HeatingCycles', 0)
+        
+        if total_time > 0:
+            efficiency_ratio = effective_time / total_time * 100
+            avg_cycle_length = total_time / max(cycles, 1)
+            
+            self.WriteLog("=== EFFICIENCY METRICS ===", "Status")
+            self.WriteLog("Total Cycles: {} | Avg Duration: {:.1f}min | Efficiency: {:.1f}%".format(
+                cycles, avg_cycle_length, efficiency_ratio), "Status")
 
 
     def AutoCallib(self):
