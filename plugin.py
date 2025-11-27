@@ -455,6 +455,11 @@ class BasePlugin:
         # Get current heating system configuration
         overshoot_tolerance = self.Internals.get('OvershootTolerance', 0.1)
         
+        # Calculate Projected Temperature (1 cycle ahead)
+        projected_temp = self.intemp + temp_trend['rate']
+        temp_trend['projected'] = projected_temp
+        self.WriteLog("Projected Temperature (in 1 cycle): {:.1f}°C".format(projected_temp), "Verbose")
+        
         # Step 1: Check for overshoot with smart tolerance
         if self.intemp > self.setpoint + overshoot_tolerance:
             self.WriteLog("Temperature exceeds setpoint + tolerance ({:.1f}°C), no heating".format(overshoot_tolerance), "Status")
@@ -462,12 +467,12 @@ class BasePlugin:
             overshoot = True
             reason = "Overshoot Prevention"
         
-        # Step 2: Check if temperature is very close to setpoint and stable/rising
-        elif abs(self.intemp - self.setpoint) <= 0.1 and (temp_trend['stable'] or temp_trend['rising']):
-            self.WriteLog("Temperature near setpoint and stable/rising, no heating needed", "Verbose")
+        # Step 2: Check if projected temperature meets setpoint (Predictive Cutoff)
+        elif projected_temp >= self.setpoint and (temp_trend['rising'] or temp_trend['stable']):
+            self.WriteLog("Projected temperature meets setpoint, no heating needed", "Verbose")
             power = 0
             overshoot = False
-            reason = "Temperature Stable at Setpoint"
+            reason = "Predicted Setpoint Reached"
         
         else:
             overshoot = False
@@ -476,20 +481,22 @@ class BasePlugin:
                 self.AutoCallib()
             else:
                 self.learn = True
+            
+            # Use Projected Temperature for calculation to naturally handle trends
+            calc_temp = projected_temp
                 
-            # Standard power calculation
+            # Standard power calculation using Projected Temperature
             if self.outtemp is None:
-                power = round((self.setpoint - self.intemp) * self.Internals["ConstC"], 1)
+                power = round((self.setpoint - calc_temp) * self.Internals["ConstC"], 1)
             else:
-                power = round((self.setpoint - self.intemp) * self.Internals["ConstC"] +
+                power = round((self.setpoint - calc_temp) * self.Internals["ConstC"] +
                               (self.setpoint - self.outtemp) * self.Internals["ConstT"], 1)
             
-            # Step 4: Apply predictive heating adjustments
-            if temp_trend['falling'] and temp_trend['rate'] < -0.1:  # Significant temperature drop
-                predictive_boost = min(10, abs(temp_trend['rate']) * 20)  # Up to 10% boost
-                power += predictive_boost
-                reason = "Predictive Heating (falling trend)"
-                self.WriteLog("Applied predictive heating boost: +{:.1f}% due to falling trend".format(predictive_boost), "Verbose")
+            # Step 4: Reason determination
+            if temp_trend['falling']:
+                reason = "Predictive Heating (Falling Trend)"
+            elif temp_trend['rising']:
+                reason = "Predictive Dampening (Rising Trend)"
             else:
                 reason = "Standard Calculation"
 
@@ -608,8 +615,8 @@ class BasePlugin:
         # Enhanced logging
         self.WriteLog("=== HEATING DECISION ===", "Status")
         self.WriteLog("Power: {:.1f}% | Duration: {:.1f}min | Reason: {}".format(power, duration, reason), "Status")
-        self.WriteLog("Current: {:.1f}°C | Setpoint: {:.1f}°C | Trend: {:.3f}°C/cycle".format(
-            self.intemp, self.setpoint, temp_trend.get('rate', 0)), "Status")
+        self.WriteLog("Current: {:.1f}°C | Projected: {:.1f}°C | Setpoint: {:.1f}°C | Trend: {:.3f}°C/cycle".format(
+            self.intemp, temp_trend.get('projected', self.intemp), self.setpoint, temp_trend.get('rate', 0)), "Status")
         
         if power == 0:
             self.switchHeat(False)
