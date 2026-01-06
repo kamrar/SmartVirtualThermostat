@@ -430,17 +430,14 @@ class BasePlugin:
                     # make sure we switch off heating if there was an error with reading the temp
                     self.switchHeat(False)
 
-        # Active Monitoring: Check temperature more frequently when heating
-        if self.heat and not self.pause and not self.forced:
-            # Check every minute if heating
-            if datetime.now() >= self.nexttemps - timedelta(minutes=4): # nexttemps is normally +5 mins
-                 self.readTemps(heating_active=True)
-                 self.checkTargetReached()
-
         if self.nexttemps <= now:
             # call the Domoticz json API for a temperature devices update, to get the lastest temps (and avoid the
             # connection time out time after 10mins that floods domoticz logs in versions of domoticz since spring 2018)
             self.readTemps()
+            
+            # Active Monitoring check
+            if self.heat and not self.pause and not self.forced:
+                self.checkTargetReached()
 
         # check if need to refresh setpoints so that they do not turn red in GUI
         if self.nextupdate <= now:
@@ -700,6 +697,9 @@ class BasePlugin:
             # Switch heating on
             self.switchHeat(True)
             
+            # Ensure next active monitor check is soon (1 min)
+            self.nexttemps = datetime.now() + timedelta(minutes=1)
+            
             # Update learning variables
             if self.Internals["ALStatus"] < 2:
                 self.Internals['LastPwr'] = power
@@ -741,10 +741,12 @@ class BasePlugin:
             # heater was on max but setpoint was not reached... no learning
             Domoticz.Debug("Last power was 100% but setpoint not reached... no callibration")
             pass
-        elif self.Internals['LastPwr'] > 0 and self.intemp <= self.Internals['LastInT']:
-            # Heater was on but temp did not rise (or dropped).
+        elif self.Internals['LastPwr'] > 0 and self.intemp <= self.Internals['LastInT'] and \
+             self.Internals['LastSetPoint'] > self.Internals['LastInT']:
+            # Heater was on but temp did not rise (or dropped), AND we were trying to raise the temperature.
             # This implies the current power was insufficient to overcome losses.
             # We must increase ConstC significantly to request more power next time.
+            
             # We simulate a small temperature rise to avoid division by zero and force a higher ConstC.
             Domoticz.Debug("Heater was on ({:.1f}%) but temperature did not rise ({} -> {}). forcing ConstC increase.".format(
                 self.Internals['LastPwr'], self.Internals['LastInT'], self.intemp))
@@ -758,8 +760,12 @@ class BasePlugin:
                                                   (timedelta.total_seconds(now - self.lastcalc) /
                                                    (self.calculate_period * 60))))
             
-            # Cap the single-step increase to avoid extreme spikes, but ensure it's aggressive
-            ConstC = min(ConstC, self.Internals['ConstC'] * 2.0)
+            # Ensure ConstC calculation result is positive (safety check)
+            if ConstC < 0:
+                 ConstC = self.Internals['ConstC'] * 1.5 # Fallback multiplier
+            else:
+                 # Cap the single-step increase to avoid extreme spikes, but ensure it's aggressive
+                 ConstC = min(ConstC, self.Internals['ConstC'] * 2.0)
             
             self.WriteLog("Forced calc for ConstC = {} (due to lack of temp rise)".format(ConstC), "Verbose")
             self.Internals['ConstC'] = round((self.Internals['ConstC'] * self.Internals['nbCC'] + ConstC) /
@@ -825,13 +831,14 @@ class BasePlugin:
             Domoticz.Debug("End Heat time = " + str(self.endheat))
 
 
-    def readTemps(self, heating_active=False):
+    def readTemps(self):
 
         # set update flag for next temp update
-        # If heating is active, we want to check again sooner (e.g. 1 minute)
-        # But to avoid breaking existing logic that relies on nexttemps being the "heartbeat" for temps,
-        # we'll keep the standard 5 min for the main timer, but allow frequent calls.
-        if not heating_active:
+        # If heating is active, we check every minute to catch the target reach event.
+        # Otherwise, standard 5 minute polling.
+        if self.heat:
+            self.nexttemps = datetime.now() + timedelta(minutes=1)
+        else:
             self.nexttemps = datetime.now() + timedelta(minutes=5)
 
         # fetch all the devices from the API and scan for sensors
