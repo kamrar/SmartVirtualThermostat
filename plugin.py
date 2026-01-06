@@ -952,8 +952,21 @@ class BasePlugin:
     def saveUserVar(self):
 
         varname = Parameters["Name"] + "-InternalVariables"
-        DomoticzAPI("type=command&param=updateuservariable&vname={}&vtype=2&vvalue={}".format(
+        # Try update first
+        result = DomoticzAPI("type=command&param=updateuservariable&vname={}&vtype=2&vvalue={}".format(
             varname, str(self.Internals)))
+        
+        # If update failed (e.g. variable doesn't exist), try add/save
+        if result is None:
+            Domoticz.Log("Update variable failed, trying to re-create variable {}".format(varname))
+            # Determine correct call based on version (logic copied from getUserVar)
+            parameter = "saveuservariable"
+            domoticzInfo = DomoticzAPI("type=command&param=getversion")
+            if domoticzInfo and LooseVersion(domoticzInfo["dzvents_version"]) >= LooseVersion("2.4.9"):
+                parameter = "adduservariable"
+            
+            DomoticzAPI("type=command&param={}&vname={}&vtype=2&vvalue={}".format(
+                parameter, varname, str(self.Internals)))
 
 
     def WriteLog(self, message, level="Normal"):
@@ -1054,7 +1067,8 @@ def DomoticzAPI(APICall):
         if response.status == 200:
             resultJson = json.loads(response.read().decode('utf-8'))
             if resultJson["status"] != "OK":
-                Domoticz.Error("Domoticz API returned an error: status = {}".format(resultJson["status"]))
+                Domoticz.Error("Domoticz API returned an error: status = {}. Msg: {}".format(
+                    resultJson["status"], resultJson.get("message", "No message")))
                 resultJson = None
         else:
             Domoticz.Error("Domoticz API: http error = {}".format(response.status))
