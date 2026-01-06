@@ -952,9 +952,18 @@ class BasePlugin:
     def saveUserVar(self):
 
         varname = Parameters["Name"] + "-InternalVariables"
+        
+        # Compact Internals to avoid "String exceeds maximum size" error
+        # Round all floats in lists to 1 decimal place
+        compact_internals = self.Internals.copy()
+        if 'TempHistory' in compact_internals:
+            compact_internals['TempHistory'] = [round(x, 1) for x in compact_internals['TempHistory']]
+        if 'LastThreeTemps' in compact_internals:
+            compact_internals['LastThreeTemps'] = [round(x, 1) for x in compact_internals['LastThreeTemps']]
+            
         # Try update first
         result = DomoticzAPI("type=command&param=updateuservariable&vname={}&vtype=2&vvalue={}".format(
-            varname, str(self.Internals)))
+            varname, str(compact_internals)))
         
         # If update failed (e.g. variable doesn't exist), try add/save
         if result is None:
@@ -966,7 +975,7 @@ class BasePlugin:
                 parameter = "adduservariable"
             
             DomoticzAPI("type=command&param={}&vname={}&vtype=2&vvalue={}".format(
-                parameter, varname, str(self.Internals)))
+                parameter, varname, str(compact_internals)))
 
 
     def WriteLog(self, message, level="Normal"):
