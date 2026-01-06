@@ -430,6 +430,13 @@ class BasePlugin:
                     # make sure we switch off heating if there was an error with reading the temp
                     self.switchHeat(False)
 
+        # Active Monitoring: Check temperature more frequently when heating
+        if self.heat and not self.pause and not self.forced:
+            # Check every minute if heating
+            if datetime.now() >= self.nexttemps - timedelta(minutes=4): # nexttemps is normally +5 mins
+                 self.readTemps(heating_active=True)
+                 self.checkTargetReached()
+
         if self.nexttemps <= now:
             # call the Domoticz json API for a temperature devices update, to get the lastest temps (and avoid the
             # connection time out time after 10mins that floods domoticz logs in versions of domoticz since spring 2018)
@@ -441,6 +448,71 @@ class BasePlugin:
             Devices[4].Update(nValue=0, sValue=Devices[4].sValue)
             Devices[5].Update(nValue=0, sValue=Devices[5].sValue)
 
+
+    def checkTargetReached(self):
+        """Active monitoring to stop heating when target is reached (Smart Hysteresis)"""
+        if not self.heat:
+            return
+
+        # Smart Hysteresis parameters
+        # InertiaOffset: Cut off slightly before setpoint to allow radiator heat to finish the job.
+        # For gas radiators, 0.1C is a safe starting point.
+        inertia_offset = 0.0 # Can be made configurable in future
+        safety_margin = 0.3 # If we exceed setpoint by this much, cut off regardless of minimum runtime
+        
+        target_temp = self.setpoint - inertia_offset
+        
+        if self.intemp >= target_temp:
+            # Calculate how long we've been running
+            # self.endheat is the scheduled end time.
+            # Duration = self.Internals['LastPwr'] * self.calculate_period / 100
+            # StartTime = EndTime - Duration
+            # But simpler: we know when we calculated. self.lastcalc.
+            # No, lastcalc is set at end of AutoMode.
+            
+            # We can approximate start time or just trust the logic:
+            # We need to know if we satisfied the Minimum Efficient Runtime.
+            
+            run_time_min = (datetime.now() - self.lastcalc).total_seconds() / 60
+            min_runtime = self.Internals.get('MinEfficiencyRuntime', 10)
+            
+            # Decision Logic
+            stop_heating = False
+            reason = ""
+            
+            if self.intemp >= self.setpoint + safety_margin:
+                stop_heating = True
+                reason = "Critical Overshoot Protection (>{})".format(safety_margin)
+            elif run_time_min >= min_runtime:
+                stop_heating = True
+                reason = "Target Reached (Smart Hysteresis)"
+            else:
+                self.WriteLog("Target reached ({}) but keeping boiler on for minimum runtime ({:.1f}/{:.1f} min)".format(
+                    self.intemp, run_time_min, min_runtime), "Verbose")
+                return
+
+            if stop_heating:
+                self.WriteLog("Stopping heating early: {} | Temp: {:.1f}".format(reason, self.intemp), "Status")
+                
+                # Calculate effective power for learning
+                # If we scheduled 20 mins but stopped at 10, LastPwr should be updated
+                # so the system learns 10 mins was enough (or that the rate was higher).
+                
+                # Original Power %
+                original_pwr = self.Internals.get('LastPwr', 0)
+                
+                # Effective Power %
+                # effective_pwr = (actual_run_time / cycle_period) * 100
+                effective_pwr = (run_time_min / self.calculate_period) * 100
+                
+                # Update Internals
+                self.Internals['LastPwr'] = effective_pwr
+                self.Internals['TotalHeatingTime'] = self.Internals.get('TotalHeatingTime', 0) - (original_pwr/100 * self.calculate_period) + run_time_min
+                
+                self.switchHeat(False)
+                self.endheat = datetime.now() # Officially end the heating cycle
+                self.heat = False
+                self.saveUserVar()
 
     def AutoMode(self):
         """Enhanced smart heating algorithm with efficiency optimizations"""
@@ -669,6 +741,32 @@ class BasePlugin:
             # heater was on max but setpoint was not reached... no learning
             Domoticz.Debug("Last power was 100% but setpoint not reached... no callibration")
             pass
+        elif self.Internals['LastPwr'] > 0 and self.intemp <= self.Internals['LastInT']:
+            # Heater was on but temp did not rise (or dropped).
+            # This implies the current power was insufficient to overcome losses.
+            # We must increase ConstC significantly to request more power next time.
+            # We simulate a small temperature rise to avoid division by zero and force a higher ConstC.
+            Domoticz.Debug("Heater was on ({:.1f}%) but temperature did not rise ({} -> {}). forcing ConstC increase.".format(
+                self.Internals['LastPwr'], self.Internals['LastInT'], self.intemp))
+            
+            # Assume a virtual rise that is very small compared to the gap we wanted to bridge
+            # This makes the ratio (Target-Start)/(Actual-Start) very large, increasing ConstC
+            virtual_rise = 0.05
+            
+            ConstC = (self.Internals['ConstC'] * ((self.Internals['LastSetPoint'] - self.Internals['LastInT']) /
+                                                  virtual_rise *
+                                                  (timedelta.total_seconds(now - self.lastcalc) /
+                                                   (self.calculate_period * 60))))
+            
+            # Cap the single-step increase to avoid extreme spikes, but ensure it's aggressive
+            ConstC = min(ConstC, self.Internals['ConstC'] * 2.0)
+            
+            self.WriteLog("Forced calc for ConstC = {} (due to lack of temp rise)".format(ConstC), "Verbose")
+            self.Internals['ConstC'] = round((self.Internals['ConstC'] * self.Internals['nbCC'] + ConstC) /
+                                             (self.Internals['nbCC'] + 1), 1)
+            self.Internals['nbCC'] = min(self.Internals['nbCC'] + 1, 50)
+            self.WriteLog("ConstC updated to {}".format(self.Internals['ConstC']), "Verbose")
+
         elif self.intemp > self.Internals['LastInT'] and self.Internals['LastSetPoint'] > self.Internals['LastInT']:
             # learning ConstC
             ConstC = (self.Internals['ConstC'] * ((self.Internals['LastSetPoint'] - self.Internals['LastInT']) /
@@ -727,10 +825,14 @@ class BasePlugin:
             Domoticz.Debug("End Heat time = " + str(self.endheat))
 
 
-    def readTemps(self):
+    def readTemps(self, heating_active=False):
 
         # set update flag for next temp update
-        self.nexttemps = datetime.now() + timedelta(minutes=5)
+        # If heating is active, we want to check again sooner (e.g. 1 minute)
+        # But to avoid breaking existing logic that relies on nexttemps being the "heartbeat" for temps,
+        # we'll keep the standard 5 min for the main timer, but allow frequent calls.
+        if not heating_active:
+            self.nexttemps = datetime.now() + timedelta(minutes=5)
 
         # fetch all the devices from the API and scan for sensors
         noerror = True
