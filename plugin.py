@@ -953,13 +953,27 @@ class BasePlugin:
 
         varname = Parameters["Name"] + "-InternalVariables"
         
-        # Compact Internals to avoid "String exceeds maximum size" error
-        # Round all floats in lists to 1 decimal place
-        compact_internals = self.Internals.copy()
-        if 'TempHistory' in compact_internals:
-            compact_internals['TempHistory'] = [round(x, 1) for x in compact_internals['TempHistory']]
-        if 'LastThreeTemps' in compact_internals:
-            compact_internals['LastThreeTemps'] = [round(x, 1) for x in compact_internals['LastThreeTemps']]
+        # Filter and compact Internals to avoid "String exceeds maximum size" error
+        # We only need to save dynamic learning data, not static configuration.
+        keys_to_save = [
+            'ConstC', 'nbCC', 'ConstT', 'nbCT',
+            'LastPwr', 'LastInT', 'LastOutT', 'LastSetPoint',
+            'TempHistory', 'LastThreeTemps', 'ALStatus',
+            'TotalHeatingTime', 'EffectiveHeatingTime', 'HeatingCycles',
+            'InefficientCycles', 'OvershootEvents'
+        ]
+        
+        compact_internals = {}
+        for key in keys_to_save:
+            if key in self.Internals:
+                val = self.Internals[key]
+                # Round floats in lists
+                if isinstance(val, list):
+                    val = [round(x, 1) if isinstance(x, float) else x for x in val]
+                # Round individual floats
+                elif isinstance(val, float):
+                    val = round(val, 2)
+                compact_internals[key] = val
             
         # Try update first
         result = DomoticzAPI("type=command&param=updateuservariable&vname={}&vtype=2&vvalue={}".format(
