@@ -50,7 +50,7 @@ Enhanced Features:
                 <option label="Custom" value="custom"/>
             </options>
         </param>
-        <param field="Mode8" label="Boiler Startup Time, Min Efficient Runtime, Radiator Lag Time (minutes)" width="200px" required="false" default="3,10,12"/>
+        <param field="Mode8" label="Boiler Startup Time, Min Efficient Runtime, Radiator Lag Time (minutes), Hysteresis Offset (0.0-2.0)" width="200px" required="false" default="3,10,12,0.0"/>
         <param field="Mode6" label="Logging Level" width="200px">
             <options>
                 <option label="Normal" value="Normal"  default="true"/>
@@ -153,7 +153,7 @@ class BasePlugin:
             'MinEfficiencyRuntime': 10,
             'RadiatorLagTime': 12,
             'OvershootTolerance': 0.1,
-            'TempHistory': [],
+            'HysteresisOffset': 0.0,
             'LastThreeTemps': [20.0, 20.0, 20.0],
             'EfficiencyMode': True,
             'TotalHeatingTime': 0,
@@ -288,14 +288,20 @@ class BasePlugin:
             profile = self.HeatingProfiles[heating_profile]
 
         # Parse custom heating system parameters (Mode8)
+        self.Internals['HysteresisOffset'] = 0.0 # Default value
+        
         if Parameters.get("Mode8", ""):
             heating_params = parseCSV(Parameters["Mode8"])
             if len(heating_params) >= 3:
                 self.Internals['BoilerStartupTime'] = CheckParam("Boiler Startup Time", heating_params[0], profile['startup_time'])
                 self.Internals['MinEfficiencyRuntime'] = CheckParam("Min Efficiency Runtime", heating_params[1], profile['min_runtime'])
                 self.Internals['RadiatorLagTime'] = CheckParam("Radiator Lag Time", heating_params[2], profile['lag_time'])
-                self.WriteLog("Custom heating parameters: Startup={}min, MinRuntime={}min, Lag={}min".format(
-                    self.Internals['BoilerStartupTime'], self.Internals['MinEfficiencyRuntime'], self.Internals['RadiatorLagTime']), "Verbose")
+                
+                if len(heating_params) >= 4:
+                    self.Internals['HysteresisOffset'] = CheckParam("Hysteresis Offset", heating_params[3], 0.0)
+                
+                self.WriteLog("Custom heating parameters: Startup={}min, MinRuntime={}min, Lag={}min, Offset={}C".format(
+                    self.Internals['BoilerStartupTime'], self.Internals['MinEfficiencyRuntime'], self.Internals['RadiatorLagTime'], self.Internals['HysteresisOffset']), "Verbose")
             else:
                 # Use profile defaults
                 self.Internals['BoilerStartupTime'] = profile['startup_time']
@@ -454,7 +460,7 @@ class BasePlugin:
         # Smart Hysteresis parameters
         # InertiaOffset: Cut off slightly before setpoint to allow radiator heat to finish the job.
         # For gas radiators, 0.1C is a safe starting point.
-        inertia_offset = 0.0 # Can be made configurable in future
+        inertia_offset = self.Internals.get('HysteresisOffset', 0.0)
         safety_margin = 0.3 # If we exceed setpoint by this much, cut off regardless of minimum runtime
         
         target_temp = self.setpoint - inertia_offset
@@ -585,11 +591,6 @@ class BasePlugin:
         self.Internals['LastThreeTemps'].append(self.intemp)
         if len(self.Internals['LastThreeTemps']) > 3:
             self.Internals['LastThreeTemps'].pop(0)
-        
-        # Maintain longer history (last 10 readings)
-        if len(self.Internals['TempHistory']) >= 10:
-            self.Internals['TempHistory'].pop(0)
-        self.Internals['TempHistory'].append(self.intemp)
 
     def analyzeTempTrend(self):
         """Analyze temperature trends for predictive heating"""
@@ -958,7 +959,7 @@ class BasePlugin:
         keys_to_save = [
             'ConstC', 'nbCC', 'ConstT', 'nbCT',
             'LastPwr', 'LastInT', 'LastOutT', 'LastSetPoint',
-            'TempHistory', 'LastThreeTemps', 'ALStatus',
+            'LastThreeTemps', 'ALStatus',
             'TotalHeatingTime', 'EffectiveHeatingTime', 'HeatingCycles',
             'InefficientCycles', 'OvershootEvents'
         ]
@@ -1058,18 +1059,15 @@ def onHeartbeat():
 def parseCSV(strCSV):
 
     listvals = []
-    i=0
     for value in strCSV.split(","):
         try:
-            if i == 5:
+            val = int(value)
+        except ValueError:
+            try:
                 val = float(value)
-            else:
-                val = int(value)
-        except:
-            pass
-        else:
-            listvals.append(val)
-        i+=1
+            except ValueError:
+                continue
+        listvals.append(val)
     return listvals
 
 
@@ -1101,10 +1099,10 @@ def DomoticzAPI(APICall):
 
 
 def CheckParam(name, value, default):
-    if type(default) is int and type(value) is int:
+    if isinstance(default, int) and isinstance(value, int):
         param = value
-    elif type(default) is float and type(value) is float:
-        param = value
+    elif isinstance(default, float) and (isinstance(value, float) or isinstance(value, int)):
+        param = float(value)
     else:
         param = default
         Domoticz.Error("Parameter '{}' has an invalid value of '{}' ! defaut of '{}' is instead used.".format(name, value, default))
