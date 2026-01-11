@@ -305,8 +305,8 @@ class BasePlugin:
             mode8_str = Parameters["Mode8"]
             heating_params = parseCSV(mode8_str)
             
-            # Debug logging for troubleshooting parameter parsing
-            self.WriteLog("Mode8 Raw: '{}', Parsed: {}".format(mode8_str, heating_params), "Verbose")
+            # Debug logging for troubleshooting parameter parsing (Force log to ensure visibility)
+            Domoticz.Log("Mode8 Raw: '{}', Parsed: {}".format(mode8_str, heating_params))
             
             if len(heating_params) > 4:
                 Domoticz.Error("Too many parameters in Mode 8! Found {}. Expected 3 or 4. Check if you are using commas instead of dots for decimals (e.g., use '0.5' not '0,5').".format(len(heating_params)))
