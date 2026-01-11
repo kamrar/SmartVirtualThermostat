@@ -161,6 +161,17 @@ class BasePlugin:
             'HeatingCycles': 0,
             'OvershootEvents': 0,
             'InefficientCycles': 0}
+            
+        # Mapping for variable minification to solve "String exceeds maximum size" error
+        self.VarMapping = {
+            'ConstC': 'cC', 'nbCC': 'nC', 'ConstT': 'cT', 'nbCT': 'nT',
+            'LastPwr': 'lp', 'LastInT': 'li', 'LastOutT': 'lo', 'LastSetPoint': 'ls',
+            'LastThreeTemps': 'l3', 'ALStatus': 'al',
+            'TotalHeatingTime': 'th', 'EffectiveHeatingTime': 'eh',
+            'HeatingCycles': 'hc', 'InefficientCycles': 'ic', 'OvershootEvents': 'oe'
+        }
+        self.RevVarMapping = {v: k for k, v in self.VarMapping.items()}
+        
         self.Internals = self.InternalsDefaults.copy()
         self.heat = False
         self.pause = False
@@ -291,7 +302,15 @@ class BasePlugin:
         self.Internals['HysteresisOffset'] = 0.0 # Default value
         
         if Parameters.get("Mode8", ""):
-            heating_params = parseCSV(Parameters["Mode8"])
+            mode8_str = Parameters["Mode8"]
+            heating_params = parseCSV(mode8_str)
+            
+            # Debug logging for troubleshooting parameter parsing
+            self.WriteLog("Mode8 Raw: '{}', Parsed: {}".format(mode8_str, heating_params), "Verbose")
+            
+            if len(heating_params) > 4:
+                Domoticz.Error("Too many parameters in Mode 8! Found {}. Expected 3 or 4. Check if you are using commas instead of dots for decimals (e.g., use '0.5' not '0,5').".format(len(heating_params)))
+
             if len(heating_params) >= 3:
                 self.Internals['BoilerStartupTime'] = CheckParam("Boiler Startup Time", heating_params[0], profile['startup_time'])
                 self.Internals['MinEfficiencyRuntime'] = CheckParam("Min Efficiency Runtime", heating_params[1], profile['min_runtime'])
@@ -941,7 +960,16 @@ class BasePlugin:
                 self.Internals = self.InternalsDefaults.copy()  # we re-initialize the internal variables
             else:
                 try:
-                    self.Internals.update(eval(valuestring))
+                    loaded_data = eval(valuestring)
+                    if isinstance(loaded_data, dict):
+                        # Check if data uses short keys and map back to long keys
+                        for key, value in loaded_data.items():
+                            if key in self.RevVarMapping:
+                                self.Internals[self.RevVarMapping[key]] = value
+                            else:
+                                self.Internals[key] = value
+                    else:
+                        self.Internals = self.InternalsDefaults.copy()
                 except:
                     self.Internals = self.InternalsDefaults.copy()
                 return
@@ -954,31 +982,24 @@ class BasePlugin:
 
         varname = Parameters["Name"] + "-InternalVariables"
         
-        # Filter and compact Internals to avoid "String exceeds maximum size" error
-        # We only need to save dynamic learning data, not static configuration.
-        keys_to_save = [
-            'ConstC', 'nbCC', 'ConstT', 'nbCT',
-            'LastPwr', 'LastInT', 'LastOutT', 'LastSetPoint',
-            'LastThreeTemps', 'ALStatus',
-            'TotalHeatingTime', 'EffectiveHeatingTime', 'HeatingCycles',
-            'InefficientCycles', 'OvershootEvents'
-        ]
+        # Minify keys and compact data to avoid "String exceeds maximum size" error
+        minified_internals = {}
         
-        compact_internals = {}
-        for key in keys_to_save:
-            if key in self.Internals:
-                val = self.Internals[key]
-                # Round floats in lists
+        for long_key, short_key in self.VarMapping.items():
+            if long_key in self.Internals:
+                val = self.Internals[long_key]
+                # Round floats in lists to 1 decimal
                 if isinstance(val, list):
                     val = [round(x, 1) if isinstance(x, float) else x for x in val]
-                # Round individual floats
+                # Round individual floats to 1 decimal
                 elif isinstance(val, float):
-                    val = round(val, 2)
-                compact_internals[key] = val
+                    val = round(val, 1)
+                
+                minified_internals[short_key] = val
             
         # Try update first
         result = DomoticzAPI("type=command&param=updateuservariable&vname={}&vtype=2&vvalue={}".format(
-            varname, str(compact_internals)))
+            varname, str(minified_internals)))
         
         # If update failed (e.g. variable doesn't exist), try add/save
         if result is None:
@@ -990,7 +1011,7 @@ class BasePlugin:
                 parameter = "adduservariable"
             
             DomoticzAPI("type=command&param={}&vname={}&vtype=2&vvalue={}".format(
-                parameter, varname, str(compact_internals)))
+                parameter, varname, str(minified_internals)))
 
 
     def WriteLog(self, message, level="Normal"):
